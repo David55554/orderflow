@@ -1,114 +1,139 @@
-# OrderFlow — Event-Driven Order Processing System
+# OrderFlow
 
-Four Spring Boot microservices coordinating an order lifecycle over Apache Kafka,
-with a saga-based compensation flow that rolls back inventory when payment fails.
+An online store's order system, split into 4 small services that talk to each
+other through Kafka messages instead of calling each other directly.
 
-**Stack:** Java 21 · Spring Boot 4.1 · Apache Kafka (KRaft) · PostgreSQL 16 · Redis 7 · Docker
+**Built with:** Java 21, Spring Boot, Kafka, PostgreSQL, Redis, Docker
 
-## Architecture
+## What it does
+
+You send an order. Four services handle it, one job each:
+
+| Service | Port | Job |
+|---|---|---|
+| order-service | 8081 | Takes the order, tracks its status |
+| inventory-service | 8082 | Sets aside the items |
+| payment-service | 8083 | Charges the customer |
+| notification-service | 8084 | Tells the customer what happened |
+
+They never call each other directly. Each one sends a message to Kafka, and
+whoever cares picks it up. So if payment-service is down for a minute, orders
+still get taken — the messages just wait.
+
+## How an order flows
+
+**When everything works:**
 
 ```
-              POST /orders
-                   │
-                   ▼
-        ┌──────────────────┐        order.created         ┌────────────────────┐
-        │  order-service   │ ───────────────────────────▶ │ inventory-service  │
-        │     :8081        │                              │       :8082        │
-        └──────────────────┘                              └────────────────────┘
-             ▲   ▲   ▲                                       │            │
-             │   │   │                            inventory.reserved   inventory.rejected
-             │   │   │                                       ▼            │
-             │   │   │                              ┌────────────────────┐│
-             │   │   └───────── payment.succeeded ──│  payment-service   ││
-             │   │                                  │       :8083        │
-             │   └───────────── payment.failed ─────└────────────────────┘
-             │                                                 │
-             │                                    inventory.release (compensation)
-             │                                                 ▼
-             │                                       back to inventory-service
-             │
-             └── order.status.changed ──▶ notification-service :8084
+You  ──POST /orders──▶  order-service   (saves it as PENDING)
+                             │
+                             │ "order.created"
+                             ▼
+                       inventory-service  (sets items aside)
+                             │
+                             │ "inventory.reserved"
+                             ▼
+                        payment-service   (charges the card)
+                             │
+                             │ "payment.succeeded"
+                             ▼
+                        order-service     (marks it CONFIRMED)
+                             │
+                             │ "order.status.changed"
+                             ▼
+                     notification-service  (emails the customer)
 ```
 
-## Event flow
+**When the payment fails:**
 
-**Happy path**
-1. `order-service` persists the order as `PENDING`, publishes `order.created`.
-2. `inventory-service` reserves stock, publishes `inventory.reserved`.
-3. `payment-service` charges, publishes `payment.succeeded`.
-4. `order-service` moves the order to `CONFIRMED`, publishes `order.status.changed`.
-5. `notification-service` consumes and logs/sends the confirmation.
+The items are already set aside at that point. We can't just stop — that stock
+would be stuck forever. So we undo it:
 
-**Saga compensation path (the interesting one)**
-1–2. Same as above — stock is reserved.
-3. Payment fails after retries → `payment.failed` lands in the DLQ *and* is published.
-4. `order-service` marks the order `FAILED` and publishes `inventory.release`.
-5. `inventory-service` un-reserves the stock. System is consistent again.
+```
+payment-service  ──"payment.failed"──▶  order-service  (marks it FAILED)
+                                             │
+                                             │ "inventory.release"
+                                             ▼
+                                      inventory-service  (puts the items back)
+```
 
-Every consumer is **idempotent**: each event carries an `eventId`, and consumers
-record processed ids so a redelivery is a no-op rather than a double charge.
+Undoing earlier steps when a later one fails is called a **saga**. It's how you
+keep things straight when there's no single database transaction to roll back.
 
-## Kafka topics
+**One more thing:** Kafka can deliver the same message twice. So every message
+carries an `eventId`, and each service remembers which ids it already handled.
+See a repeat, skip it. Otherwise a customer could get charged twice.
 
-| Topic                  | Producer            | Consumer(s)                    | Key       |
-|------------------------|---------------------|--------------------------------|-----------|
-| `order.created`        | order-service       | inventory-service              | `orderId` |
-| `inventory.reserved`   | inventory-service   | payment-service                | `orderId` |
-| `inventory.rejected`   | inventory-service   | order-service                  | `orderId` |
-| `inventory.release`    | order-service       | inventory-service              | `orderId` |
-| `payment.succeeded`    | payment-service     | order-service                  | `orderId` |
-| `payment.failed`       | payment-service     | order-service                  | `orderId` |
-| `order.status.changed` | order-service       | notification-service           | `orderId` |
-| `*.DLT`                | Spring retry infra  | (inspection / replay)          | `orderId` |
+## The messages
 
-Keying by `orderId` guarantees per-order ordering within a partition.
+| Message | Sent by | Read by |
+|---|---|---|
+| `order.created` | order-service | inventory-service |
+| `inventory.reserved` | inventory-service | payment-service |
+| `inventory.rejected` | inventory-service | order-service |
+| `inventory.release` | order-service | inventory-service |
+| `payment.succeeded` | payment-service | order-service |
+| `payment.failed` | payment-service | order-service |
+| `order.status.changed` | order-service | notification-service |
 
-## Running the infrastructure
+Every message is tagged with its `orderId`. That's what keeps one order's
+messages in the right order.
+
+If a message keeps failing, Kafka moves it to a `.DLT` topic (a "dead letter"
+pile) so it stops blocking everything behind it and you can look at it later.
+
+## Running it
+
+Start the databases and Kafka:
 
 ```bash
-docker compose up -d      # Kafka, Postgres, Redis, Kafka UI
-docker compose ps         # all should be healthy
-docker compose down       # stop (add -v to wipe Postgres data)
+docker compose up -d      # start
+docker compose ps         # check they're all healthy
+docker compose down       # stop
 ```
 
-| Service    | Address                | Credentials           |
-|------------|------------------------|-----------------------|
-| Kafka      | `localhost:9092`       | —                     |
-| Postgres   | `localhost:5432`       | `orderflow`/`orderflow` (db `orderflow`) |
-| Redis      | `localhost:6379`       | —                     |
-| Kafka UI   | http://localhost:8085  | —                     |
+| What | Where | Login |
+|---|---|---|
+| Kafka | localhost:9092 | — |
+| Postgres | localhost:5432 | orderflow / orderflow |
+| Redis | localhost:6379 | — |
+| Kafka UI (see messages in a browser) | http://localhost:8085 | — |
 
-Each service owns a Postgres **schema** (`orders`, `inventory`, `payments`,
-`notifications`) — the service-per-database boundary without four containers.
-
-## Running a service
+Start a service:
 
 ```bash
 cd order-service
 ./mvnw spring-boot:run
 ```
 
-## Roadmap
+Note: use `./mvnw`, not `mvn`. It's included in the project, so you don't have
+to install Maven.
 
-**Week 1 — foundation**
-- [x] Docker infrastructure: Kafka (KRaft), Postgres, Redis
-- [ ] `order-service`: Order entity, repository, `POST /orders`, `GET /orders/{id}`
-- [ ] Publish `order.created` on order creation
-- [ ] `inventory-service`: consume `order.created`, reserve stock
+Each service gets its own section of the Postgres database (`orders`,
+`inventory`, `payments`, `notifications`) so they don't touch each other's
+tables.
+
+## To do
+
+**Week 1 — get it running**
+- [x] Docker: Kafka, Postgres, Redis
+- [ ] order-service: save an order, read it back
+- [ ] Send `order.created` when an order comes in
+- [ ] inventory-service: read `order.created`, set items aside
 
 **Week 2 — the saga**
-- [ ] `payment-service`: consume `inventory.reserved`, simulate success/failure
-- [ ] Compensation: `payment.failed` → `inventory.release` → stock restored
-- [ ] Idempotent consumers keyed on `eventId`
-- [ ] Retry + dead-letter topics via `DefaultErrorHandler`
+- [ ] payment-service: charge, sometimes fail on purpose
+- [ ] Put the items back when payment fails
+- [ ] Skip messages we've already handled
+- [ ] Retry failed messages, then send them to `.DLT`
 
-**Week 3 — performance**
-- [ ] `notification-service` consuming `order.status.changed`
-- [ ] Indexes on the inventory lookup path; measure baseline latency
-- [ ] Redis cache-aside over inventory lookups; measure again
-- [ ] JMeter load test at 500 req/s, record before/after numbers
+**Week 3 — make it fast**
+- [ ] notification-service
+- [ ] Time how slow inventory lookups are
+- [ ] Add Redis caching, time it again
+- [ ] Load test with JMeter, write down the before/after numbers
 
-**Week 4 — deployment**
-- [ ] Dockerfile per service, added to `docker-compose.yml`
-- [ ] GitHub Actions: build + test on push
-- [ ] Deploy to AWS EC2
+**Week 4 — deploy it**
+- [ ] A Dockerfile for each service
+- [ ] GitHub Actions to build and test on every push
+- [ ] Run it on AWS EC2
